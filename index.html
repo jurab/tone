@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>tone</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #0b0b0c; color: #ddd; font: 13px/1.4 ui-monospace, Menlo, monospace; }
+  #wrap { position: fixed; inset: 0; display: flex; flex-direction: column; }
+  #bar { padding: 8px 12px; display: flex; gap: 12px; align-items: center; border-bottom: 1px solid #222; }
+  button { background: #1a1a1d; color: #ddd; border: 1px solid #333; padding: 6px 10px; cursor: pointer; font: inherit; }
+  button:hover { background: #26262a; }
+  #readout { margin-left: auto; opacity: .8; }
+  #readout b { color: #8ef; }
+  canvas { flex: 1; display: block; width: 100%; }
+  select { background: #1a1a1d; color: #ddd; border: 1px solid #333; padding: 5px; font: inherit; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="bar">
+    <button id="toggle">start mic</button>
+    <label>range:
+      <select id="range">
+        <option value="2">2 octaves</option>
+        <option value="3" selected>3 octaves</option>
+        <option value="4">4 octaves</option>
+      </select>
+    </label>
+    <label>center:
+      <select id="center">
+        <option value="48">C3</option>
+        <option value="55">G3</option>
+        <option value="60" selected>C4</option>
+        <option value="67">G4</option>
+        <option value="72">C5</option>
+      </select>
+    </label>
+    <span id="readout">— Hz · — · cents —</span>
+  </div>
+  <canvas id="cv"></canvas>
+</div>
+<script>
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+const toggle = document.getElementById('toggle');
+const rangeSel = document.getElementById('range');
+const centerSel = document.getElementById('center');
+const readout = document.getElementById('readout');
+
+const NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+const noteName = m => NOTE_NAMES[((m % 12) + 12) % 12] + (Math.floor(m/12) - 1);
+const midiToHz = m => 440 * Math.pow(2, (m - 69) / 12);
+const hzToMidi = f => 69 + 12 * Math.log2(f / 440);
+
+// scrolling history of detected pitch (midi float, or null for unvoiced)
+const HIST = 600;
+const history = new Array(HIST).fill(null);
+let writeIdx = 0;
+let lastDetect = { hz: 0, midi: null, conf: 0 };
+
+let audioCtx = null, stream = null, source = null, analyser = null;
+let buf = null, sampleRate = 0;
+let running = false;
+let lastSampleTime = 0;
+
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  cv.width = cv.clientWidth * dpr;
+  cv.height = cv.clientHeight * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener('resize', resize);
+
+// --- pitch detection: autocorrelation with parabolic interpolation ---
+// returns { hz, confidence } or { hz: 0, confidence: 0 } if unvoiced
+function detectPitch(buf, sr) {
+  const N = buf.length;
+  // RMS gate
+  let sum = 0;
+  for (let i = 0; i < N; i++) sum += buf[i] * buf[i];
+  const rms = Math.sqrt(sum / N);
+  if (rms < 0.01) return { hz: 0, confidence: 0 };
+
+  // search range: 70 Hz – 1200 Hz (covers most human voice + a bit)
+  const minLag = Math.floor(sr / 1200);
+  const maxLag = Math.floor(sr / 70);
+
+  // normalized autocorrelation difference function (YIN-style, simplified)
+  const d = new Float32Array(maxLag + 1);
+  for (let tau = minLag; tau <= maxLag; tau++) {
+    let s = 0;
+    for (let i = 0; i < N - maxLag; i++) {
+      const diff = buf[i] - buf[i + tau];
+      s += diff * diff;
+    }
+    d[tau] = s;
+  }
+  // cumulative mean normalized
+  const cmnd = new Float32Array(maxLag + 1);
+  cmnd[0] = 1;
+  let running = 0;
+  for (let tau = 1; tau <= maxLag; tau++) {
+    running += d[tau];
+    cmnd[tau] = tau < minLag ? 1 : d[tau] * tau / running;
+  }
+  // absolute threshold
+  const thresh = 0.15;
+  let tauEst = -1;
+  for (let tau = minLag; tau <= maxLag; tau++) {
+    if (cmnd[tau] < thresh) {
+      while (tau + 1 <= maxLag && cmnd[tau + 1] < cmnd[tau]) tau++;
+      tauEst = tau;
+      break;
+    }
+  }
+  if (tauEst === -1) {
+    // fallback: pick global min
+    let best = minLag, bv = cmnd[minLag];
+    for (let tau = minLag + 1; tau <= maxLag; tau++) {
+      if (cmnd[tau] < bv) { bv = cmnd[tau]; best = tau; }
+    }
+    if (bv > 0.5) return { hz: 0, confidence: 0 };
+    tauEst = best;
+  }
+  // parabolic interpolation
+  const x0 = tauEst > minLag ? tauEst - 1 : tauEst;
+  const x2 = tauEst < maxLag ? tauEst + 1 : tauEst;
+  const y0 = cmnd[x0], y1 = cmnd[tauEst], y2 = cmnd[x2];
+  const denom = (y0 - 2 * y1 + y2);
+  const tauRefined = denom !== 0 ? tauEst + 0.5 * (y0 - y2) / denom : tauEst;
+
+  return { hz: sr / tauRefined, confidence: 1 - cmnd[tauEst] };
+}
+
+// --- drawing ---
+function draw(now) {
+  sample(now || 0);
+  const w = cv.clientWidth, h = cv.clientHeight;
+  ctx.fillStyle = '#0b0b0c';
+  ctx.fillRect(0, 0, w, h);
+
+  const center = parseInt(centerSel.value);
+  const octaves = parseInt(rangeSel.value);
+  const lowMidi = center - octaves * 6;
+  const highMidi = center + octaves * 6;
+  const span = highMidi - lowMidi;
+
+  const midiToY = m => h - ((m - lowMidi) / span) * h;
+  const SCALE_W = 50;
+  const plotRight = w - SCALE_W;
+
+  // grid lines: every semitone faint, every C bold, A4 highlighted
+  for (let m = Math.ceil(lowMidi); m <= highMidi; m++) {
+    const y = midiToY(m);
+    const pc = ((m % 12) + 12) % 12;
+    if (m === 69) ctx.strokeStyle = '#3a4a3a';
+    else if (pc === 0) ctx.strokeStyle = '#2a2a30';
+    else ctx.strokeStyle = '#15151a';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(plotRight, y);
+    ctx.stroke();
+
+    // label on right side, next to the indicator
+    const isAccent = pc === 0 || m === 69;
+    ctx.fillStyle = m === 69 ? '#7a8' : (pc === 0 ? '#666' : '#333');
+    ctx.font = (isAccent ? '11px' : '10px') + ' ui-monospace, Menlo, monospace';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(noteName(m), plotRight + 8, y);
+  }
+
+  // separator
+  ctx.strokeStyle = '#222';
+  ctx.beginPath(); ctx.moveTo(plotRight, 0); ctx.lineTo(plotRight, h); ctx.stroke();
+
+  // history trace
+  const plotW = plotRight;
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = '#8ef';
+  ctx.beginPath();
+  let drawing = false;
+  for (let i = 0; i < HIST; i++) {
+    // oldest sample on left, newest on right
+    const idx = (writeIdx + i) % HIST;
+    const v = history[idx];
+    const x = (i / (HIST - 1)) * plotW;
+    if (v == null) { drawing = false; continue; }
+    const y = midiToY(v);
+    if (!drawing) { ctx.moveTo(x, y); drawing = true; }
+    else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+
+  // current note dot + cents indicator
+  const cur = history[(writeIdx - 1 + HIST) % HIST];
+  if (cur != null) {
+    const nearest = Math.round(cur);
+    const cents = Math.round((cur - nearest) * 100);
+    const y = midiToY(cur);
+    ctx.fillStyle = '#8ef';
+    ctx.beginPath();
+    ctx.arc(plotRight, y, 4, 0, Math.PI * 2);
+    ctx.fill();
+    readout.innerHTML = `${lastDetect.hz.toFixed(1)} Hz · <b>${noteName(nearest)}</b> · ${cents >= 0 ? '+' : ''}${cents}¢`;
+  } else {
+    readout.textContent = '— Hz · — · cents —';
+  }
+
+  requestAnimationFrame(draw);
+}
+
+async function start() {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+  } catch (e) {
+    alert('mic denied: ' + e.message);
+    return;
+  }
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  sampleRate = audioCtx.sampleRate;
+  source = audioCtx.createMediaStreamSource(stream);
+
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 2048;
+  analyser.smoothingTimeConstant = 0;
+  buf = new Float32Array(analyser.fftSize);
+  source.connect(analyser);
+  // intentionally NOT connecting analyser to destination — avoids hearing ourselves
+  running = true;
+  lastSampleTime = 0;
+  toggle.textContent = 'stop mic';
+}
+
+function stop() {
+  if (analyser) analyser.disconnect();
+  if (source) source.disconnect();
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  if (audioCtx) audioCtx.close();
+  audioCtx = stream = source = analyser = null;
+  running = false;
+  toggle.textContent = 'start mic';
+}
+
+// poll the analyser at a fixed cadence (~46ms, matching our old buffer length)
+function sample(now) {
+  if (!running || !analyser) return;
+  if (now - lastSampleTime < 45) return;
+  lastSampleTime = now;
+  analyser.getFloatTimeDomainData(buf);
+  const { hz, confidence } = detectPitch(buf, sampleRate);
+  lastDetect = { hz, confidence };
+  history[writeIdx] = (hz > 0 && confidence > 0.5) ? hzToMidi(hz) : null;
+  writeIdx = (writeIdx + 1) % HIST;
+}
+
+toggle.addEventListener('click', () => running ? stop() : start());
+
+resize();
+requestAnimationFrame(draw);
+</script>
+</body>
+</html>
