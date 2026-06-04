@@ -90,8 +90,8 @@ struct App {
     history: Vec<Option<f32>>,        // midi values (None = unvoiced)
     write_idx: usize,
     last_sample_t: f64,
-    range_octaves: i32,
-    center_midi: i32,
+    range_octaves: f32, // octaves of vertical span (continuous, for pinch-zoom)
+    center_midi: f32,   // grid center note (continuous, for scroll-pan)
     rms_gate: f32,
     err: Option<String>,
     needs_focus: bool,
@@ -106,17 +106,15 @@ impl App {
             _out_stream: None,
             target_midi: None,
             tone_on: false,
-            tone_vol: 0.2,
+            tone_vol: 0.6,
             sample_rate: 48000,
             history: vec![None; HIST_LEN],
             write_idx: 0,
             last_sample_t: 0.0,
-            range_octaves: 3,
-            center_midi: 48,
-            rms_gate: 0.008, // ~-42 dB: rejects sub-note room/string noise while
-            // keeping the resolvable part of a decaying pluck. NSDF clarity does
-            // the pitched/unpitched call above this; raise via the slider for
-            // very quiet sustained material (voice tails).
+            range_octaves: 3.0,
+            center_midi: 48.0,
+            rms_gate: 0.0001, // -80 dB: very open; the NSDF clarity floor does the
+            // real pitched/unpitched call, so the gate just skips dead silence.
             err: None,
             needs_focus: true,
         };
@@ -287,6 +285,16 @@ impl eframe::App for App {
             0.0
         });
 
+        // view navigation: scroll to pan the center note, pinch (or ctrl+scroll)
+        // to zoom the octave range. (flip the scroll sign if it feels inverted.)
+        let (scroll_y, zoom) = ctx.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
+        if scroll_y != 0.0 {
+            self.center_midi = (self.center_midi + scroll_y * 0.02).clamp(30.0, 90.0);
+        }
+        if zoom != 1.0 {
+            self.range_octaves = (self.range_octaves / zoom).clamp(1.0, 6.0);
+        }
+
         egui::TopBottomPanel::top("bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if let Some(err) = &self.err {
@@ -295,18 +303,18 @@ impl eframe::App for App {
                 }
                 ui.label("range:");
                 egui::ComboBox::from_id_source("range")
-                    .selected_text(format!("{} oct", self.range_octaves))
+                    .selected_text(format!("{:.1} oct", self.range_octaves))
                     .show_ui(ui, |ui| {
-                        for v in [2, 3, 4, 5] {
-                            ui.selectable_value(&mut self.range_octaves, v, format!("{v} oct"));
+                        for v in [2.0, 3.0, 4.0, 5.0] {
+                            ui.selectable_value(&mut self.range_octaves, v, format!("{v:.0} oct"));
                         }
                     });
                 ui.label("center:");
                 egui::ComboBox::from_id_source("center")
-                    .selected_text(note_name(self.center_midi))
+                    .selected_text(note_name(self.center_midi.round() as i32))
                     .show_ui(ui, |ui| {
                         for v in [48, 55, 60, 67, 72] {
-                            ui.selectable_value(&mut self.center_midi, v, note_name(v));
+                            ui.selectable_value(&mut self.center_midi, v as f32, note_name(v));
                         }
                     });
                 ui.label("gate:");
@@ -356,8 +364,8 @@ impl eframe::App for App {
             // drag to retune continuously (snapped to semitones).
             let resp = ui.allocate_rect(rect, egui::Sense::click_and_drag());
             let plot_right = rect.right() - 50.0; // matches draw_plot scale_w
-            let low = (self.center_midi - self.range_octaves * 6) as f32;
-            let high = (self.center_midi + self.range_octaves * 6) as f32;
+            let low = self.center_midi - self.range_octaves * 6.0;
+            let high = self.center_midi + self.range_octaves * 6.0;
             let pos_to_note = |pos: Pos2| {
                 let frac = (rect.bottom() - pos.y) / rect.height();
                 (low + frac * (high - low)).round()
@@ -419,14 +427,14 @@ impl App {
             Pos2::new(plot_right, rect.bottom()),
         );
 
-        let low_midi = self.center_midi - self.range_octaves * 6;
-        let high_midi = self.center_midi + self.range_octaves * 6;
-        let span = (high_midi - low_midi) as f32;
+        let low_midi = self.center_midi - self.range_octaves * 6.0;
+        let high_midi = self.center_midi + self.range_octaves * 6.0;
+        let span = high_midi - low_midi;
         let h = plot_rect.height();
-        let midi_to_y = |m: f32| plot_rect.bottom() - ((m - low_midi as f32) / span) * h;
+        let midi_to_y = |m: f32| plot_rect.bottom() - ((m - low_midi) / span) * h;
 
-        // grid + labels
-        for m in low_midi..=high_midi {
+        // grid + labels — integer note lines within the (continuous) range
+        for m in low_midi.ceil() as i32..=high_midi.floor() as i32 {
             let y = midi_to_y(m as f32);
             let pc = ((m % 12) + 12) % 12;
             let (col, label_col, font_sz) = if m == 69 {

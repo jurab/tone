@@ -16,8 +16,8 @@ cargo run --release
 
 Top bar controls:
 
-- **range** — vertical span of the grid (2–5 octaves)
-- **center** — note the grid is centred on
+- **range** — vertical span of the grid (presets, or **pinch** to zoom)
+- **center** — note the grid is centred on (presets, or **two-finger scroll** to pan)
 - **gate** — RMS noise gate in dB; raise it to ignore quiet background, lower it
   to track faint decays. The live readout shows `Hz / note / cents`.
 - **reference tone** — click anywhere on the plot to drop a target-note line
