@@ -2,8 +2,8 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui;
 use egui::{Color32, Pos2, Rect, Stroke, Vec2};
 use std::sync::{Arc, Mutex};
+use tone::{detect_pitch, hz_to_midi, note_name, FRAME_SIZE};
 
-const FRAME_SIZE: usize = 2048;
 const HIST_LEN: usize = 800;
 const UI_HZ: f32 = 60.0;
 
@@ -47,154 +47,18 @@ impl Shared {
     }
 }
 
-// YIN-style pitch detection. returns (hz, confidence, rms).
-// hz=0, conf=0 means unvoiced.
-fn detect_pitch(buf: &[f32], sample_rate: u32, rms_gate: f32) -> (f32, f32, f32) {
-    let n = buf.len();
-
-    // RMS gate
-    let mut sum_sq = 0.0f32;
-    for &x in buf {
-        sum_sq += x * x;
-    }
-    let rms = (sum_sq / n as f32).sqrt();
-    if rms < rms_gate {
-        return (0.0, 0.0, rms);
-    }
-
-    let sr = sample_rate as f32;
-    let min_lag = (sr / 1200.0).floor() as usize;
-    let max_lag = (sr / 70.0).floor() as usize;
-    if max_lag >= n {
-        return (0.0, 0.0, rms);
-    }
-
-    // difference function d[tau]
-    let mut d = vec![0.0f32; max_lag + 1];
-    for tau in min_lag..=max_lag {
-        let mut s = 0.0f32;
-        let lim = n - max_lag;
-        for i in 0..lim {
-            let diff = buf[i] - buf[i + tau];
-            s += diff * diff;
-        }
-        d[tau] = s;
-    }
-
-    // cumulative mean normalized difference
-    let mut cmnd = vec![1.0f32; max_lag + 1];
-    let mut running = 0.0f32;
-    for tau in 1..=max_lag {
-        running += d[tau];
-        if tau >= min_lag && running > 0.0 {
-            cmnd[tau] = d[tau] * tau as f32 / running;
-        }
-    }
-
-    // absolute threshold: first dip below 0.15
-    let thresh = 0.15f32;
-    let mut tau_est: i32 = -1;
-    let mut tau = min_lag;
-    while tau <= max_lag {
-        if cmnd[tau] < thresh {
-            // descend to local min
-            while tau + 1 <= max_lag && cmnd[tau + 1] < cmnd[tau] {
-                tau += 1;
-            }
-            tau_est = tau as i32;
-            break;
-        }
-        tau += 1;
-    }
-    if tau_est < 0 {
-        // fallback: global min, only accept if reasonable
-        let mut best = min_lag;
-        let mut bv = cmnd[min_lag];
-        for t in (min_lag + 1)..=max_lag {
-            if cmnd[t] < bv {
-                bv = cmnd[t];
-                best = t;
-            }
-        }
-        if bv > 0.5 {
-            return (0.0, 0.0, rms);
-        }
-        tau_est = best as i32;
-    }
-
-    // octave correction: only flip to a multiple if its dip is meaningfully
-    // *deeper* than the candidate's. YIN's normalization makes a true
-    // fundamental's multiples slightly shallower, so a real octave-up error
-    // shows up as a multiple noticeably deeper than the candidate.
-    let t0_est = tau_est as usize;
-    let mut t = t0_est;
-    for mult in 2..=4 {
-        let center = t * mult;
-        if center > max_lag {
-            break;
-        }
-        let win = (t / 6).max(2);
-        let lo = center.saturating_sub(win).max(min_lag);
-        let hi = (center + win).min(max_lag);
-        let (mut bi, mut bv) = (lo, cmnd[lo]);
-        for k in (lo + 1)..=hi {
-            if cmnd[k] < bv {
-                bv = cmnd[k];
-                bi = k;
-            }
-        }
-        // require the multiple to be at least ~25% deeper than current candidate
-        if bv < cmnd[t] * 0.8 {
-            t = bi;
-        } else {
-            break;
-        }
-    }
-
-    // parabolic interpolation around final t
-    let t0 = if t > min_lag { t - 1 } else { t };
-    let t2 = if t < max_lag { t + 1 } else { t };
-    let y0 = cmnd[t0];
-    let y1 = cmnd[t];
-    let y2 = cmnd[t2];
-    let denom = y0 - 2.0 * y1 + y2;
-    let tau_refined = if denom != 0.0 {
-        t as f32 + 0.5 * (y0 - y2) / denom
-    } else {
-        t as f32
-    };
-
-    let hz = sr / tau_refined;
-    let confidence = 1.0 - cmnd[t];
-    (hz, confidence, rms)
-}
-
-fn hz_to_midi(hz: f32) -> f32 {
-    69.0 + 12.0 * (hz / 440.0).log2()
-}
-
-const NOTE_NAMES: [&str; 12] = [
-    "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
-];
-
-fn note_name(midi: i32) -> String {
-    let pc = ((midi % 12) + 12) % 12;
-    let oct = midi.div_euclid(12) - 1;
-    format!("{}{}", NOTE_NAMES[pc as usize], oct)
-}
-
 struct App {
     shared: Arc<Mutex<Shared>>,
     _stream: Option<cpal::Stream>,
     sample_rate: u32,
     history: Vec<Option<f32>>,        // midi values (None = unvoiced)
     write_idx: usize,
-    last_hz: f32,
     last_sample_t: f64,
     range_octaves: i32,
     center_midi: i32,
     rms_gate: f32,
     err: Option<String>,
+    needs_focus: bool,
 }
 
 impl App {
@@ -205,12 +69,15 @@ impl App {
             sample_rate: 48000,
             history: vec![None; HIST_LEN],
             write_idx: 0,
-            last_hz: 0.0,
             last_sample_t: 0.0,
             range_octaves: 3,
             center_midi: 48,
-            rms_gate: 0.001,
+            rms_gate: 0.008, // ~-42 dB: rejects sub-note room/string noise while
+            // keeping the resolvable part of a decaying pluck. NSDF clarity does
+            // the pitched/unpitched call above this; raise via the slider for
+            // very quiet sustained material (voice tails).
             err: None,
+            needs_focus: true,
         };
         if let Err(e) = app.start_audio() {
             app.err = Some(format!("audio init failed: {e}"));
@@ -298,9 +165,10 @@ impl App {
             s.snapshot(&mut buf);
         }
 
-        let (hz, conf, _rms) = detect_pitch(&buf, self.sample_rate, self.rms_gate);
-        self.last_hz = hz;
-        self.history[self.write_idx] = if hz > 0.0 && conf > 0.5 {
+        // the detector owns the voicing decision (RMS gate + NSDF clarity floor):
+        // hz == 0 means unvoiced. trust it — no extra confidence threshold here.
+        let (hz, _conf, _rms) = detect_pitch(&buf, self.sample_rate, self.rms_gate);
+        self.history[self.write_idx] = if hz > 0.0 {
             Some(hz_to_midi(hz))
         } else {
             None
@@ -312,6 +180,10 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        if self.needs_focus {
+            self.needs_focus = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
         self.sample_pitch(ctx);
 
         egui::TopBottomPanel::top("bar").show(ctx, |ui| {
@@ -346,16 +218,13 @@ impl eframe::App for App {
                     self.rms_gate = 10f32.powf(gate_db / 20.0);
                 }
                 ui.separator();
-                let cur = self.history[(self.write_idx + HIST_LEN - 1) % HIST_LEN];
-                if let Some(m) = cur {
+                // readout uses the same median-filtered value as the trace, so a
+                // momentary glitch frame can't flicker the displayed note.
+                if let Some(m) = self.median5(HIST_LEN - 1) {
                     let nearest = m.round() as i32;
                     let cents = ((m - nearest as f32) * 100.0).round() as i32;
-                    ui.label(format!(
-                        "{:.1} Hz   {}   {:+}¢",
-                        self.last_hz,
-                        note_name(nearest),
-                        cents
-                    ));
+                    let hz = 440.0 * 2f32.powf((m - 69.0) / 12.0);
+                    ui.label(format!("{:.1} Hz   {}   {:+}¢", hz, note_name(nearest), cents));
                 } else {
                     ui.label("— Hz   —   —¢");
                 }
@@ -370,6 +239,25 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// 5-wide centered median of the voiced pitch history around chronological
+    /// index `i` (0 = oldest on screen). Kills the 1-2 frame octave/onset spikes
+    /// the per-frame detector still emits at note edges, while leaving sustained
+    /// pitch — and vibrato/slides slower than ~5 frames — untouched. Returns None
+    /// when the window holds fewer than 3 voiced frames (an isolated blip, not a
+    /// real note).
+    fn median5(&self, i: usize) -> Option<f32> {
+        let lo = i.saturating_sub(2);
+        let hi = (i + 2).min(HIST_LEN - 1);
+        let mut vals: Vec<f32> = (lo..=hi)
+            .filter_map(|j| self.history[(self.write_idx + j) % HIST_LEN])
+            .collect();
+        if vals.len() < 3 {
+            return None;
+        }
+        vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        Some(vals[vals.len() / 2])
+    }
+
     fn draw_plot(&self, ui: &mut egui::Ui, rect: Rect) {
         let painter = ui.painter_at(rect);
         let bg = Color32::from_rgb(11, 11, 12);
@@ -433,40 +321,15 @@ impl App {
             Stroke::new(1.0, Color32::from_rgb(34, 34, 34)),
         );
 
-        // history trace with outlier-island rejection at draw time.
-        // a point is suppressed iff there exists a window radius w ∈ {1,2,3}
-        // such that the points at i±w bracket a stable signal (close to each
-        // other) and the current point is far from both. this catches isolated
-        // single-frame spikes as well as 2- and 3-frame islands; longer runs
-        // are treated as real signal.
+        // history trace, median-filtered (see median5): connect consecutive
+        // voiced frames, break on unvoiced.
         let trace = Color32::from_rgb(136, 238, 255);
         let plot_w = plot_rect.width();
         let mut prev_pt: Option<Pos2> = None;
-        const SPIKE_DELTA: f32 = 4.0;     // semitones from each shoulder
-        const NEIGHBOR_DELTA: f32 = 2.0;  // semitones between the two shoulders
-        const MAX_W: i32 = 3;
 
-        let at = |i: i32| -> Option<f32> {
-            if i < 0 || i >= HIST_LEN as i32 {
-                None
-            } else {
-                self.history[(self.write_idx + i as usize) % HIST_LEN]
-            }
-        };
-
-        for i in 0..HIST_LEN as i32 {
-            let curr = at(i);
-            let is_spike = match curr {
-                Some(c) => (1..=MAX_W).any(|w| {
-                    matches!((at(i - w), at(i + w)), (Some(l), Some(r))
-                        if (l - r).abs() < NEIGHBOR_DELTA
-                        && (c - l).abs() > SPIKE_DELTA
-                        && (c - r).abs() > SPIKE_DELTA)
-                }),
-                None => false,
-            };
-            match curr {
-                Some(m) if !is_spike => {
+        for i in 0..HIST_LEN {
+            match self.median5(i) {
+                Some(m) => {
                     let x = plot_rect.left() + (i as f32 / (HIST_LEN as f32 - 1.0)) * plot_w;
                     let p = Pos2::new(x, midi_to_y(m));
                     if let Some(pp) = prev_pt {
@@ -474,16 +337,12 @@ impl App {
                     }
                     prev_pt = Some(p);
                 }
-                Some(_) => {
-                    // suppressed spike: keep prev_pt so the line bridges across
-                }
                 None => prev_pt = None,
             }
         }
 
         // current dot
-        let cur = self.history[(self.write_idx + HIST_LEN - 1) % HIST_LEN];
-        if let Some(m) = cur {
+        if let Some(m) = self.median5(HIST_LEN - 1) {
             let y = midi_to_y(m);
             painter.circle_filled(Pos2::new(plot_right, y), 4.0, trace);
         }
@@ -494,6 +353,7 @@ fn main() -> Result<(), eframe::Error> {
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(Vec2::new(1100.0, 600.0))
+            .with_active(true)
             .with_title("tone"),
         ..Default::default()
     };
