@@ -1,6 +1,8 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui;
 use egui::{Color32, Pos2, Rect, Stroke, Vec2};
+use std::f32::consts::TAU;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tone::{detect_pitch, hz_to_midi, note_name, FRAME_SIZE};
 
@@ -47,9 +49,43 @@ impl Shared {
     }
 }
 
+/// Reference-tone oscillator state, shared lock-free with the audio output
+/// callback. freq/gain are stored as f32 bits in atomics so the realtime thread
+/// never blocks on a lock.
+struct Tone {
+    freq: AtomicU32,
+    gain: AtomicU32, // target linear amplitude; 0 = silent
+}
+
+impl Tone {
+    fn new() -> Self {
+        Self {
+            freq: AtomicU32::new(440f32.to_bits()),
+            gain: AtomicU32::new(0.0f32.to_bits()),
+        }
+    }
+    fn set_freq(&self, f: f32) {
+        self.freq.store(f.to_bits(), Ordering::Relaxed);
+    }
+    fn freq(&self) -> f32 {
+        f32::from_bits(self.freq.load(Ordering::Relaxed))
+    }
+    fn set_gain(&self, g: f32) {
+        self.gain.store(g.to_bits(), Ordering::Relaxed);
+    }
+    fn gain(&self) -> f32 {
+        f32::from_bits(self.gain.load(Ordering::Relaxed))
+    }
+}
+
 struct App {
     shared: Arc<Mutex<Shared>>,
     _stream: Option<cpal::Stream>,
+    tone: Arc<Tone>,
+    _out_stream: Option<cpal::Stream>,
+    target_midi: Option<f32>, // reference-tone target note (snapped to a semitone)
+    tone_on: bool,
+    tone_vol: f32,
     sample_rate: u32,
     history: Vec<Option<f32>>,        // midi values (None = unvoiced)
     write_idx: usize,
@@ -66,6 +102,11 @@ impl App {
         let mut app = Self {
             shared: Arc::new(Mutex::new(Shared::new())),
             _stream: None,
+            tone: Arc::new(Tone::new()),
+            _out_stream: None,
+            target_midi: None,
+            tone_on: false,
+            tone_vol: 0.2,
             sample_rate: 48000,
             history: vec![None; HIST_LEN],
             write_idx: 0,
@@ -82,7 +123,57 @@ impl App {
         if let Err(e) = app.start_audio() {
             app.err = Some(format!("audio init failed: {e}"));
         }
+        if let Err(e) = app.start_output() {
+            // non-fatal: the tuner still works without the reference tone
+            eprintln!("reference-tone output unavailable: {e}");
+        }
         app
+    }
+
+    fn start_output(&mut self) -> Result<(), String> {
+        let host = cpal::default_host();
+        let device = host
+            .default_output_device()
+            .ok_or_else(|| "no default output device".to_string())?;
+        let config = device.default_output_config().map_err(|e| format!("{e}"))?;
+        let sr = config.sample_rate().0 as f32;
+        let channels = config.channels() as usize;
+        let tone = Arc::clone(&self.tone);
+        let err_fn = |e| eprintln!("output stream error: {e}");
+
+        // oscillator state lives in the callback; phase continuity + a one-pole
+        // gain ramp toward the target avoid clicks on start/stop/retune.
+        let mut phase = 0.0f32;
+        let mut cur_gain = 0.0f32;
+
+        let stream = match config.sample_format() {
+            cpal::SampleFormat::F32 => device.build_output_stream(
+                &config.into(),
+                move |data: &mut [f32], _| {
+                    let step = TAU * tone.freq() / sr;
+                    let target = tone.gain();
+                    for frame in data.chunks_mut(channels) {
+                        cur_gain += (target - cur_gain) * 0.0008; // ~25 ms fade
+                        let s = phase.sin() * cur_gain;
+                        phase += step;
+                        if phase >= TAU {
+                            phase -= TAU;
+                        }
+                        for x in frame.iter_mut() {
+                            *x = s;
+                        }
+                    }
+                },
+                err_fn,
+                None,
+            ),
+            other => return Err(format!("unsupported output sample format: {other:?}")),
+        }
+        .map_err(|e| format!("{e}"))?;
+
+        stream.play().map_err(|e| format!("{e}"))?;
+        self._out_stream = Some(stream);
+        Ok(())
     }
 
     fn start_audio(&mut self) -> Result<(), String> {
@@ -186,6 +277,16 @@ impl eframe::App for App {
         }
         self.sample_pitch(ctx);
 
+        // keep the audio output's oscillator in sync with the target + controls
+        if let Some(m) = self.target_midi {
+            self.tone.set_freq(440.0 * 2f32.powf((m - 69.0) / 12.0));
+        }
+        self.tone.set_gain(if self.tone_on && self.target_midi.is_some() {
+            self.tone_vol
+        } else {
+            0.0
+        });
+
         egui::TopBottomPanel::top("bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if let Some(err) = &self.err {
@@ -228,11 +329,59 @@ impl eframe::App for App {
                 } else {
                     ui.label("— Hz   —   —¢");
                 }
+
+                // reference tone: click the plot to set the target note, then play it
+                ui.separator();
+                let label = match self.target_midi {
+                    Some(m) => format!("♪ play {}", note_name(m.round() as i32)),
+                    None => "♪ click plot to set".to_string(),
+                };
+                ui.add_enabled_ui(self.target_midi.is_some(), |ui| {
+                    ui.toggle_value(&mut self.tone_on, label);
+                });
+                ui.label("vol:");
+                ui.spacing_mut().slider_width = 90.0;
+                ui.add(
+                    egui::Slider::new(&mut self.tone_vol, 0.0..=1.0)
+                        .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+                );
             });
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
             let rect = ui.available_rect_before_wrap();
+            // click anywhere on the plot to drop a target-note line (snapped to a
+            // semitone) and start the reference tone there.
+            // click a note to set + play it; click the same note again to mute;
+            // drag to retune continuously (snapped to semitones).
+            let resp = ui.allocate_rect(rect, egui::Sense::click_and_drag());
+            let plot_right = rect.right() - 50.0; // matches draw_plot scale_w
+            let low = (self.center_midi - self.range_octaves * 6) as f32;
+            let high = (self.center_midi + self.range_octaves * 6) as f32;
+            let pos_to_note = |pos: Pos2| {
+                let frac = (rect.bottom() - pos.y) / rect.height();
+                (low + frac * (high - low)).round()
+            };
+            if resp.dragged() {
+                if let Some(pos) = resp.interact_pointer_pos() {
+                    if pos.x <= plot_right {
+                        self.target_midi = Some(pos_to_note(pos));
+                        self.tone_on = true;
+                    }
+                }
+            } else if resp.clicked() {
+                if let Some(pos) = resp.interact_pointer_pos() {
+                    if pos.x <= plot_right {
+                        let m = pos_to_note(pos);
+                        if self.target_midi == Some(m) {
+                            self.tone_on = !self.tone_on; // same note → toggle mute
+                        } else {
+                            self.target_midi = Some(m);
+                            self.tone_on = true;
+                        }
+                    }
+                }
+            }
             self.draw_plot(ui, rect);
         });
     }
@@ -320,6 +469,27 @@ impl App {
             ],
             Stroke::new(1.0, Color32::from_rgb(34, 34, 34)),
         );
+
+        // target reference line (set by clicking the plot)
+        if let Some(m) = self.target_midi {
+            let y = midi_to_y(m);
+            let col = if self.tone_on {
+                Color32::from_rgb(255, 196, 92) // amber, lit when sounding
+            } else {
+                Color32::from_rgb(150, 120, 70)
+            };
+            painter.line_segment(
+                [Pos2::new(plot_rect.left(), y), Pos2::new(plot_rect.right(), y)],
+                Stroke::new(if self.tone_on { 2.0 } else { 1.5 }, col),
+            );
+            painter.text(
+                Pos2::new(plot_rect.left() + 6.0, y - 4.0),
+                egui::Align2::LEFT_BOTTOM,
+                format!("target {}", note_name(m.round() as i32)),
+                egui::FontId::monospace(11.0),
+                col,
+            );
+        }
 
         // history trace, median-filtered (see median5): connect consecutive
         // voiced frames, break on unvoiced.

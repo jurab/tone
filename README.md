@@ -20,6 +20,11 @@ Top bar controls:
 - **center** — note the grid is centred on
 - **gate** — RMS noise gate in dB; raise it to ignore quiet background, lower it
   to track faint decays. The live readout shows `Hz / note / cents`.
+- **reference tone** — click anywhere on the plot to drop a target-note line
+  (snapped to a semitone) and play a sine reference at that pitch; **drag** to
+  retune, **click the same note** again to mute. Top bar has a play toggle and a
+  volume slider. Use headphones so the tone doesn't leak into the mic — then sing
+  against the line and watch your trace chase it.
 
 macOS will prompt for microphone access on first launch.
 
@@ -73,9 +78,10 @@ ffmpeg -i test_audio/e3_ref.m4a -ac 1 -ar 48000 -c:a pcm_f32le test_audio/e3_ref
 
 ## Status / roadmap
 
-Working: live pitch trace, octave-stable detection, range/center/gate controls.
+Working: live pitch trace, octave-stable detection, range/center/gate controls,
+click/drag target line + sine reference tone.
 
-Planned: pick-a-target practice loop (anchor line + reference tone), a fretboard
-sidebar, and a staff-notation sidebar.
+Planned: a fretboard sidebar and a staff-notation sidebar (the same target note
+shown on the neck and on a staff).
 
 `index.html` is the original browser prototype, kept for reference.
