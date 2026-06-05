@@ -26,21 +26,23 @@ pub const FRAME_SIZE: usize = 4096;
 const MIN_HZ: f32 = 60.0;
 const MAX_HZ: f32 = 1200.0;
 
-/// Octave-correction strength: climb from the tallest peak to a shorter integer
-/// sub-multiple only if that sub-period's NSDF is ≥ K_SUB·gmax. Sits in the gap
-/// between a genuine sub-octave (~0.9·gmax) and a mere harmonic (~0.7·gmax).
-/// Higher ⇒ less octave-UP, more octave-DOWN.
-const K_SUB: f32 = 0.88;
+/// Peak-pick threshold: accept the first (shortest-period) NSDF peak reaching
+/// this fraction of the tallest peak. Sits between a voice harmonic (~0.85·gmax)
+/// and the fundamental (~0.95·gmax), so the scan skips overtones and lands on
+/// the fundamental. Higher ⇒ more octave-UP risk; lower ⇒ more sub-octave risk.
+const K_PEAK: f32 = 0.92;
 
-/// Minimum tallest-peak NSDF value for a frame to count as voiced (pitched).
-/// Below this the frame is non-periodic (noise / silence / attack transient).
-const CLARITY_FLOOR: f32 = 0.85;
+/// Default voicing clarity floor (min tallest-peak NSDF for a frame to count as
+/// pitched). Lower tracks quieter/breathier voice with fewer dropouts but
+/// re-admits weak frames that can octave-slip on a decaying string; raise toward
+/// ~0.85 for plucked-instrument cleanliness. Exposed as a UI slider.
+pub const DEFAULT_CLARITY: f32 = 0.7;
 
 /// Estimate the fundamental of `buf`. Returns `(hz, clarity, rms)`.
-/// `hz == 0.0` (and `clarity == 0.0`) means unvoiced: either below the RMS gate
-/// or no sufficiently-periodic structure. `clarity` is the NSDF value at the
-/// chosen peak, in [0, 1].
-pub fn detect_pitch(buf: &[f32], sample_rate: u32, rms_gate: f32) -> (f32, f32, f32) {
+/// `hz == 0.0` (and `clarity == 0.0`) means unvoiced: below the RMS gate, or no
+/// periodic structure reaching `clarity_floor`. `clarity` is the NSDF value at
+/// the chosen peak, in [0, 1].
+pub fn detect_pitch(buf: &[f32], sample_rate: u32, rms_gate: f32, clarity_floor: f32) -> (f32, f32, f32) {
     let n = buf.len();
 
     // RMS gate (cheap voicing / silence reject before the O(N·τ) inner loop)
@@ -92,46 +94,34 @@ pub fn detect_pitch(buf: &[f32], sample_rate: u32, rms_gate: f32) -> (f32, f32, 
         nsdf[tau] = if m > 0.0 { 2.0 * acf / m } else { 0.0 };
     }
 
-    // Find the tallest NSDF peak (strongest periodicity) at lag τ*.
-    let mut tstar = 0usize;
+    // Collect local-maximum peaks and the tallest one's height (gmax).
+    let mut peaks: Vec<usize> = Vec::new();
     let mut gmax = 0.0f32;
     for tau in (min_lag + 1)..max_lag {
-        if nsdf[tau] > nsdf[tau - 1] && nsdf[tau] >= nsdf[tau + 1] && nsdf[tau] > gmax {
-            gmax = nsdf[tau];
-            tstar = tau;
+        if nsdf[tau] > nsdf[tau - 1] && nsdf[tau] >= nsdf[tau + 1] && nsdf[tau] > 0.0 {
+            peaks.push(tau);
+            if nsdf[tau] > gmax {
+                gmax = nsdf[tau];
+            }
         }
     }
-    if tstar == 0 || gmax < CLARITY_FLOOR {
+    if peaks.is_empty() || gmax < clarity_floor {
         return (0.0, 0.0, rms);
     }
 
-    // Octave correction. The tallest peak is the strongest periodicity, but on a
-    // tone whose octave partial dominates (a decaying string) it can land on
-    // 2·period — an octave too LOW. The true fundamental is then a shorter
-    // integer sub-multiple τ*/d whose own peak is NEARLY AS STRONG. Climb to the
-    // shortest such sub-multiple with NSDF ≥ K_SUB·gmax. A mere harmonic of an
-    // already-correct fundamental (D2's 2nd partial at τ*/2) has a markedly
-    // weaker peak, so it fails — fixing octave-DOWN without inducing octave-UP.
-    // The long analysis window is what separates the two cases: it sharpens the
-    // NSDF so a genuine sub-octave scores ≳0.9·gmax while a harmonic stays lower.
-    let mut chosen = tstar;
-    for d in 2..=4 {
-        let target = tstar / d;
-        if target < min_lag {
+    // McLeod selection: the FIRST (shortest-period / highest-frequency) peak that
+    // reaches K_PEAK·gmax. Tuned for voice: scanning up from the shortest period
+    // lands on the fundamental, because (a) a dominant SUB-octave peak sits at
+    // 2·period — a longer lag, reached later — and (b) the voice's own harmonics
+    // (H2/H3 at shorter lags) score below K_PEAK, so the scan skips them instead
+    // of "jumping up" onto them. K_PEAK lives between the harmonic peak (~0.85)
+    // and the fundamental (~0.95).
+    let level = K_PEAK * gmax;
+    let mut chosen = peaks[0];
+    for &p in &peaks {
+        if nsdf[p] >= level {
+            chosen = p;
             break;
-        }
-        let win = (target / 20).max(2);
-        let lo = target.saturating_sub(win).max(min_lag);
-        let hi = (target + win).min(max_lag);
-        let (mut bv, mut bi) = (0.0f32, target);
-        for k in lo..=hi {
-            if nsdf[k] > bv {
-                bv = nsdf[k];
-                bi = k;
-            }
-        }
-        if bv >= K_SUB * gmax {
-            chosen = bi; // shortest qualifying sub-multiple wins (largest d)
         }
     }
 

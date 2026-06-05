@@ -6,7 +6,7 @@
 
 use std::env;
 use std::fs;
-use tone::{detect_pitch, hz_to_midi, note_name, FRAME_SIZE};
+use tone::{detect_pitch, hz_to_midi, note_name, DEFAULT_CLARITY, FRAME_SIZE};
 
 const UI_HZ: f32 = 60.0; // match the live app's sampling cadence
 
@@ -36,12 +36,13 @@ fn main() {
 
     let csv = env::var("CSV").is_ok();
     let window: usize = env::var("WINDOW").ok().and_then(|v| v.parse().ok()).unwrap_or(FRAME_SIZE);
+    let clarity: f32 = env::var("CLAR").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_CLARITY);
 
     let hop = (sr as f32 / UI_HZ).round() as usize; // ~800 @ 48k
     let mut track: Vec<(f32, f32, f32, f32)> = Vec::new(); // (t, hz, conf, rms)
     let mut s = 0usize;
     while s + window <= samples.len() {
-        let (hz, conf, rms) = detect_pitch(&samples[s..s + window], sr, gate);
+        let (hz, conf, rms) = detect_pitch(&samples[s..s + window], sr, gate, clarity);
         track.push((s as f32 / sr as f32, hz, conf, rms));
         s += hop;
     }

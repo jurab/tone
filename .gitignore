@@ -3,3 +3,6 @@
 # generated test artifacts (regenerate from the .m4a sources + scripts)
 test_audio/*.wav
 test_audio/*.png
+
+# in-app mic recordings
+/recordings/

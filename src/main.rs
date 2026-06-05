@@ -2,9 +2,41 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui;
 use egui::{Color32, Pos2, Rect, Stroke, Vec2};
 use std::f32::consts::TAU;
+use std::io::Write;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use tone::{detect_pitch, hz_to_midi, note_name, FRAME_SIZE};
+use tone::{detect_pitch, hz_to_midi, note_name, DEFAULT_CLARITY, FRAME_SIZE};
+
+/// Write mono f32 samples as a 16-bit PCM WAV (universally playable, and read by
+/// the offline analyzer + the python scripts). Returns the path written.
+fn write_wav_i16(samples: &[f32], sr: u32) -> std::io::Result<std::path::PathBuf> {
+    std::fs::create_dir_all("recordings")?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let path = std::path::Path::new("recordings").join(format!("rec_{stamp}.wav"));
+    let mut f = std::io::BufWriter::new(std::fs::File::create(&path)?);
+    let data_bytes = (samples.len() * 2) as u32;
+    f.write_all(b"RIFF")?;
+    f.write_all(&(36 + data_bytes).to_le_bytes())?;
+    f.write_all(b"WAVE")?;
+    f.write_all(b"fmt ")?;
+    f.write_all(&16u32.to_le_bytes())?; // fmt chunk size
+    f.write_all(&1u16.to_le_bytes())?; // PCM
+    f.write_all(&1u16.to_le_bytes())?; // mono
+    f.write_all(&sr.to_le_bytes())?;
+    f.write_all(&(sr * 2).to_le_bytes())?; // byte rate
+    f.write_all(&2u16.to_le_bytes())?; // block align
+    f.write_all(&16u16.to_le_bytes())?; // bits per sample
+    f.write_all(b"data")?;
+    f.write_all(&data_bytes.to_le_bytes())?;
+    for &x in samples {
+        f.write_all(&((x.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes())?;
+    }
+    f.flush()?;
+    Ok(std::env::current_dir().map(|d| d.join(&path)).unwrap_or(path))
+}
 
 const HIST_LEN: usize = 800;
 const UI_HZ: f32 = 60.0;
@@ -14,6 +46,8 @@ struct Shared {
     // most recent FRAME_SIZE samples (mono, f32, [-1,1])
     ring: Vec<f32>,
     write: usize,
+    recording: bool,
+    rec: Vec<f32>, // accumulated mono samples while recording
 }
 
 impl Shared {
@@ -21,6 +55,8 @@ impl Shared {
         Self {
             ring: vec![0.0; FRAME_SIZE],
             write: 0,
+            recording: false,
+            rec: Vec::new(),
         }
     }
 
@@ -35,6 +71,9 @@ impl Shared {
             s /= channels as f32;
             self.ring[self.write] = s;
             self.write = (self.write + 1) % FRAME_SIZE;
+            if self.recording {
+                self.rec.push(s);
+            }
             i += channels;
         }
     }
@@ -93,6 +132,10 @@ struct App {
     range_octaves: f32, // octaves of vertical span (continuous, for pinch-zoom)
     center_midi: f32,   // grid center note (continuous, for scroll-pan)
     rms_gate: f32,
+    clarity: f32, // NSDF voicing floor; low = track quiet voice, high = clean plucks
+    recording: bool,
+    rec_start: f64,
+    last_saved: Option<String>,
     err: Option<String>,
     needs_focus: bool,
 }
@@ -115,6 +158,10 @@ impl App {
             center_midi: 48.0,
             rms_gate: 0.0001, // -80 dB: very open; the NSDF clarity floor does the
             // real pitched/unpitched call, so the gate just skips dead silence.
+            clarity: DEFAULT_CLARITY,
+            recording: false,
+            rec_start: 0.0,
+            last_saved: None,
             err: None,
             needs_focus: true,
         };
@@ -256,13 +303,44 @@ impl App {
 
         // the detector owns the voicing decision (RMS gate + NSDF clarity floor):
         // hz == 0 means unvoiced. trust it — no extra confidence threshold here.
-        let (hz, _conf, _rms) = detect_pitch(&buf, self.sample_rate, self.rms_gate);
+        let (hz, _conf, _rms) = detect_pitch(&buf, self.sample_rate, self.rms_gate, self.clarity);
         self.history[self.write_idx] = if hz > 0.0 {
             Some(hz_to_midi(hz))
         } else {
             None
         };
         self.write_idx = (self.write_idx + 1) % HIST_LEN;
+    }
+
+    fn toggle_record(&mut self, now: f64) {
+        if self.recording {
+            self.recording = false;
+            let samples = {
+                let mut s = self.shared.lock().unwrap();
+                s.recording = false;
+                std::mem::take(&mut s.rec)
+            };
+            if !samples.is_empty() {
+                let secs = samples.len() as f32 / self.sample_rate as f32;
+                match write_wav_i16(&samples, self.sample_rate) {
+                    Ok(p) => {
+                        let path = p.display().to_string();
+                        println!("recorded {secs:.1}s -> {path}");
+                        self.last_saved = Some(path);
+                    }
+                    Err(e) => self.last_saved = Some(format!("save failed: {e}")),
+                }
+            }
+        } else {
+            {
+                let mut s = self.shared.lock().unwrap();
+                s.rec = Vec::with_capacity(self.sample_rate as usize * 60);
+                s.recording = true;
+            }
+            self.recording = true;
+            self.rec_start = now;
+            self.last_saved = None;
+        }
     }
 }
 
@@ -274,6 +352,7 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
         self.sample_pitch(ctx);
+        let now = ctx.input(|i| i.time);
 
         // keep the audio output's oscillator in sync with the target + controls
         if let Some(m) = self.target_midi {
@@ -317,6 +396,7 @@ impl eframe::App for App {
                             ui.selectable_value(&mut self.center_midi, v as f32, note_name(v));
                         }
                     });
+                ui.spacing_mut().slider_width = 70.0; // keep the row compact
                 ui.label("gate:");
                 // log slider for rms gate; dB display
                 let mut gate_db = 20.0 * self.rms_gate.max(1e-6).log10();
@@ -326,6 +406,9 @@ impl eframe::App for App {
                 {
                     self.rms_gate = 10f32.powf(gate_db / 20.0);
                 }
+                // clarity floor: low = track quiet/breathy voice, high = clean plucks
+                ui.label("clarity:");
+                ui.add(egui::Slider::new(&mut self.clarity, 0.4..=0.95));
                 ui.separator();
                 // readout uses the same median-filtered value as the trace, so a
                 // momentary glitch frame can't flicker the displayed note.
@@ -348,11 +431,30 @@ impl eframe::App for App {
                     ui.toggle_value(&mut self.tone_on, label);
                 });
                 ui.label("vol:");
-                ui.spacing_mut().slider_width = 90.0;
                 ui.add(
                     egui::Slider::new(&mut self.tone_vol, 0.0..=1.0)
                         .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
                 );
+
+                // record the mic to a WAV (for capturing test clips)
+                ui.separator();
+                let rec_label = if self.recording {
+                    format!("⏺ {:.1}s", now - self.rec_start)
+                } else {
+                    "⏺ rec".to_string()
+                };
+                let fill = if self.recording {
+                    Color32::from_rgb(170, 45, 45)
+                } else {
+                    Color32::from_gray(40)
+                };
+                if ui.add(egui::Button::new(rec_label).fill(fill)).clicked() {
+                    self.toggle_record(now);
+                }
+                if let Some(p) = &self.last_saved {
+                    let name = p.rsplit('/').next().unwrap_or(p);
+                    ui.label(format!("saved {name}"));
+                }
             });
         });
 
@@ -530,7 +632,7 @@ impl App {
 fn main() -> Result<(), eframe::Error> {
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size(Vec2::new(1100.0, 600.0))
+            .with_inner_size(Vec2::new(1320.0, 600.0))
             .with_active(true)
             .with_title("tone"),
         ..Default::default()
